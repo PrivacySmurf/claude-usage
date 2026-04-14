@@ -869,8 +869,8 @@ function setTab(tab, persist=true) {
   const codexCard = document.getElementById('codex-strip-card');
   const geminiCard = document.getElementById('gemini-strip-card');
   const strip = document.querySelector('.status-strip');
-  // Models filter: Claude tab + Combined only (Claude-specific)
-  if (filterModels) filterModels.style.display = (tab === 'claude' || tab === 'combined') ? '' : 'none';
+  // Models filter: Claude tab only (Claude-specific)
+  if (filterModels) filterModels.style.display = (tab === 'claude') ? '' : 'none';
   // Range filter: all tabs
   if (filterRange) filterRange.style.display = '';
   // Filter bar visible whenever any child is visible (always true since range shows everywhere)
@@ -1722,11 +1722,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/rescan":
-            # Full rebuild: delete DB and rescan from scratch
+            # Full rebuild: delete DB and rescan from scratch (all providers)
             if DB_PATH.exists():
                 DB_PATH.unlink()
-            from scanner import scan
+            from scanner import scan, scan_codex, scan_gemini
             result = scan(verbose=False)
+            try:
+                codex_result = scan_codex(verbose=False)
+                result["codex"] = codex_result
+            except Exception as e:
+                result["codex_error"] = str(e)
+            try:
+                scan_gemini()
+                result["gemini"] = "ok"
+            except Exception as e:
+                result["gemini_error"] = str(e)
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
