@@ -1,5 +1,5 @@
 """
-dashboard.py - Local web dashboard served on localhost:8080.
+dashboard.py - Local web dashboard served on localhost:9123.
 """
 
 import json
@@ -10,6 +10,92 @@ from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+
+def get_codex_status(db_path=DB_PATH):
+    """Get Codex rate limit status, merging JSONL data and usage-monitor state."""
+    import time
+
+    result = {"state": "unavailable"}
+    best_ts = 0
+
+    # Source 1: codex_rate_limits table (from JSONL scanner)
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM codex_rate_limits WHERE id=1").fetchone()
+            conn.close()
+            if row:
+                best_ts = row["scraped_at"] or 0
+                result = {
+                    "state": "green",
+                    "primary_pct": row["primary_pct"],
+                    "primary_resets_at": row["primary_resets_at"],
+                    "secondary_pct": row["secondary_pct"],
+                    "secondary_resets_at": row["secondary_resets_at"],
+                    "plan_type": (row["plan_type"] or "").title() or None,
+                    "credits_has": bool(row["credits_has"]),
+                    "freshness_s": int(time.time()) - best_ts,
+                    "auth_ok": True,
+                    "source": "jsonl",
+                }
+        except Exception:
+            pass
+
+    # Source 2: usage-monitor-state.json (from wham poll)
+    state_file = Path.home() / ".cc-agents" / "scripts" / "usage-monitor-state.json"
+    if state_file.exists():
+        try:
+            with open(state_file) as f:
+                mon = json.load(f)
+            # usage-monitor stores codex data under codex_five_hour / codex_seven_day
+            mon_ts_str = mon.get("timestamp") or mon.get("ts") or ""
+            mon_ts = 0
+            if mon_ts_str:
+                try:
+                    dt = datetime.fromisoformat(mon_ts_str.replace("Z", "+00:00"))
+                    mon_ts = int(dt.timestamp())
+                except Exception:
+                    pass
+            if mon_ts > best_ts:
+                best_ts = mon_ts
+                fh = mon.get("codex_five_hour", {})
+                sd = mon.get("codex_seven_day", {})
+                result = {
+                    "state": "green",
+                    "primary_pct": fh.get("pct"),
+                    "primary_resets_at": None,
+                    "secondary_pct": sd.get("pct"),
+                    "secondary_resets_at": None,
+                    "plan_type": None,
+                    "credits_has": False,
+                    "freshness_s": int(time.time()) - mon_ts,
+                    "auth_ok": True,
+                    "source": "monitor",
+                }
+        except Exception:
+            pass
+
+    # Format reset times as human strings
+    def _fmt_resets(ts):
+        if not ts:
+            return None
+        import time as time_mod
+        delta = ts - int(time_mod.time())
+        if delta <= 0:
+            return "Resets soon"
+        h = delta // 3600
+        m = (delta % 3600) // 60
+        if h > 0:
+            return f"in {h}h {m}m"
+        return f"in {m}m"
+
+    if "primary_resets_at" in result:
+        result["primary_resets_str"] = _fmt_resets(result.get("primary_resets_at"))
+        result["secondary_resets_str"] = _fmt_resets(result.get("secondary_resets_at"))
+
+    return result
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -23,6 +109,7 @@ def get_dashboard_data(db_path=DB_PATH):
     model_rows = conn.execute("""
         SELECT COALESCE(model, 'unknown') as model
         FROM turns
+        WHERE COALESCE(provider, 'claude') = 'claude'
         GROUP BY model
         ORDER BY SUM(input_tokens + output_tokens) DESC
     """).fetchall()
@@ -39,6 +126,7 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(cache_creation_tokens) as cache_creation,
             COUNT(*)                   as turns
         FROM turns
+        WHERE COALESCE(provider, 'claude') = 'claude'
         GROUP BY day, model
         ORDER BY day, model
     """).fetchall()
@@ -60,6 +148,7 @@ def get_dashboard_data(db_path=DB_PATH):
             total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count
         FROM sessions
+        WHERE COALESCE(provider, 'claude') = 'claude'
         ORDER BY last_timestamp DESC
     """).fetchall()
 
@@ -87,11 +176,85 @@ def get_dashboard_data(db_path=DB_PATH):
 
     conn.close()
 
+    # --- Codex data ---
+    codex_daily_rows = []
+    codex_sessions_all = []
+    combined_daily_rows = []
+
+    if db_path.exists():
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+
+        # Codex daily
+        cdrows = conn2.execute("""
+            SELECT substr(timestamp,1,10) as day,
+                   COALESCE(model,'gpt-5') as model,
+                   SUM(input_tokens) as input, SUM(output_tokens) as output,
+                   SUM(cache_read_tokens) as cache_read, COUNT(*) as turns
+            FROM turns WHERE provider='codex'
+            GROUP BY day, model ORDER BY day, model
+        """).fetchall()
+        codex_daily_rows = [{
+            "day": r["day"], "model": r["model"],
+            "input": r["input"] or 0, "output": r["output"] or 0,
+            "cache_read": r["cache_read"] or 0, "turns": r["turns"] or 0,
+        } for r in cdrows]
+
+        # Codex sessions
+        csrows = conn2.execute("""
+            SELECT session_id, project_name, first_timestamp, last_timestamp,
+                   total_input_tokens, total_output_tokens,
+                   total_cache_read, model, turn_count
+            FROM sessions WHERE provider='codex'
+            ORDER BY last_timestamp DESC
+        """).fetchall()
+        for r in csrows:
+            try:
+                t1 = datetime.fromisoformat((r["first_timestamp"] or "").replace("Z","+00:00"))
+                t2 = datetime.fromisoformat((r["last_timestamp"] or "").replace("Z","+00:00"))
+                dur = round((t2-t1).total_seconds()/60, 1)
+            except Exception:
+                dur = 0
+            codex_sessions_all.append({
+                "session_id": (r["session_id"] or "")[:8],
+                "project": r["project_name"] or "unknown",
+                "last": (r["last_timestamp"] or "")[:16].replace("T"," "),
+                "last_date": (r["last_timestamp"] or "")[:10],
+                "duration_min": dur,
+                "model": r["model"] or "gpt-5",
+                "turns": r["turn_count"] or 0,
+                "input": r["total_input_tokens"] or 0,
+                "output": r["total_output_tokens"] or 0,
+                "cache_read": r["total_cache_read"] or 0,
+            })
+
+        # Combined daily (both providers)
+        combrows = conn2.execute("""
+            SELECT substr(timestamp,1,10) as day,
+                   COALESCE(provider,'claude') as provider,
+                   SUM(input_tokens) as input, SUM(output_tokens) as output,
+                   SUM(cache_read_tokens) as cache_read, COUNT(*) as turns
+            FROM turns GROUP BY day, provider ORDER BY day, provider
+        """).fetchall()
+        combined_daily_rows = [{
+            "day": r["day"], "provider": r["provider"],
+            "input": r["input"] or 0, "output": r["output"] or 0,
+            "cache_read": r["cache_read"] or 0, "turns": r["turns"] or 0,
+        } for r in combrows]
+
+        conn2.close()
+
+    codex_strip = get_codex_status(db_path)
+
     return {
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "codex_strip":    codex_strip,
+        "codex_daily":    codex_daily_rows,
+        "codex_sessions": codex_sessions_all,
+        "combined_daily": combined_daily_rows,
     }
 
 
@@ -100,7 +263,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Usage Dashboard</title>
+<title>AI Usage Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -181,15 +344,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .footer-content a:hover { text-decoration: underline; }
 
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+
+  /* Tab bar */
+  .tab-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; display: flex; }
+  .tab-btn { padding: 12px 20px; background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); font-size: 13px; font-weight: 500; cursor: pointer; transition: color 0.15s, border-color 0.15s; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* Rate-limit strip */
+  .rl-strip { background: var(--card); border-bottom: 1px solid var(--border); padding: 8px 24px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  .rl-col { display: flex; align-items: center; gap: 10px; }
+  .rl-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+  .rl-gauge { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+  .rl-bar { width: 56px; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .rl-bar-fill { height: 100%; border-radius: 3px; }
+  .rl-bar-fill.low  { background: var(--green); }
+  .rl-bar-fill.mid  { background: #f59e0b; }
+  .rl-bar-fill.high { background: #ef4444; }
+  .rl-chip { font-size: 11px; padding: 2px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  .rl-sep { width: 1px; height: 28px; background: var(--border); flex-shrink: 0; }
+  .rl-placeholder { color: var(--muted); font-size: 12px; font-style: italic; }
+  .rl-fresh { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Claude Code Usage Dashboard</h1>
+  <h1>AI Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
   <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
 </header>
 
+<div class="tab-bar">
+  <button class="tab-btn" id="tab-claude" onclick="switchTab('claude')">Claude</button>
+  <button class="tab-btn" id="tab-codex" onclick="switchTab('codex')">Codex</button>
+  <button class="tab-btn" id="tab-combined" onclick="switchTab('combined')">Combined</button>
+</div>
+
+<div class="rl-strip">
+  <div class="rl-col">
+    <span class="rl-label">Codex</span>
+    <span id="rl-codex-content"><span class="rl-placeholder">loading…</span></span>
+  </div>
+  <div class="rl-sep"></div>
+  <div class="rl-col">
+    <span class="rl-label">Gemini</span>
+    <span class="rl-placeholder">not configured — run <code>gemini auth login</code></span>
+  </div>
+</div>
+
+<div class="tab-pane" id="pane-claude">
 <div id="filter-bar">
   <div class="filter-label">Models</div>
   <div id="model-checkboxes"></div>
@@ -268,6 +473,55 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </table>
   </div>
 </div>
+</div><!-- end pane-claude -->
+
+<div class="tab-pane" id="pane-codex">
+  <div class="container">
+    <div class="stats-row" id="codex-stats-row"></div>
+    <div class="charts-grid">
+      <div class="chart-card wide">
+        <h2>Daily Codex Usage</h2>
+        <div class="chart-wrap tall"><canvas id="chart-codex-daily"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h2>By Model</h2>
+        <div class="chart-wrap"><canvas id="chart-codex-model"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h2>Top Projects</h2>
+        <div class="chart-wrap"><canvas id="chart-codex-project"></canvas></div>
+      </div>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Cost by Model</div>
+      <table><thead><tr>
+        <th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Cache Read</th><th>Est. Cost</th>
+      </tr></thead><tbody id="codex-model-cost-body"></tbody></table>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Sessions</div>
+      <table><thead><tr>
+        <th>Session</th><th>Project</th><th>Last Active</th><th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Est. Cost</th>
+      </tr></thead><tbody id="codex-sessions-body"></tbody></table>
+    </div>
+  </div>
+</div><!-- end pane-codex -->
+
+<div class="tab-pane" id="pane-combined">
+  <div class="container">
+    <div class="stats-row" id="combined-stats-row"></div>
+    <div class="charts-grid">
+      <div class="chart-card wide">
+        <h2>Daily Usage by Provider</h2>
+        <div class="chart-wrap tall"><canvas id="chart-combined-daily"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h2>Token Share by Provider</h2>
+        <div class="chart-wrap"><canvas id="chart-combined-donut"></canvas></div>
+      </div>
+    </div>
+  </div>
+</div><!-- end pane-combined -->
 
 <footer>
   <div class="footer-content">
@@ -877,9 +1131,206 @@ async function loadData() {
     }
 
     applyFilter();
+    renderStrip(d);
+    if (currentTab === 'codex') renderCodexTab(d);
+    if (currentTab === 'combined') renderCombinedTab(d);
+    if (isFirstLoad) initTabs();
   } catch(e) {
     console.error(e);
   }
+}
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+const TAB_KEY = 'aidash_tab';
+let currentTab = localStorage.getItem(TAB_KEY) || 'claude';
+
+function switchTab(tab) {
+  currentTab = tab;
+  localStorage.setItem(TAB_KEY, tab);
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  const btn = document.getElementById('tab-' + tab);
+  if (btn) btn.classList.add('active');
+  const pane = document.getElementById('pane-' + tab);
+  if (pane) pane.classList.add('active');
+  if (tab === 'codex' && rawData) renderCodexTab(rawData);
+  if (tab === 'combined' && rawData) renderCombinedTab(rawData);
+}
+
+function initTabs() {
+  switchTab(currentTab);
+}
+
+// ── Rate-limit strip ───────────────────────────────────────────────────────
+function gaugeClass(pct) {
+  if (pct == null) return 'low';
+  if (pct >= 80) return 'high';
+  if (pct >= 50) return 'mid';
+  return 'low';
+}
+
+function renderStrip(data) {
+  const cs = data.codex_strip || {};
+  let html = '';
+  if (!cs.state || cs.state === 'unavailable') {
+    html = '<span class="rl-placeholder">unavailable</span>';
+  } else {
+    const fmtGauge = (label, pct, resetStr) => {
+      if (pct == null) return '';
+      const cls = gaugeClass(pct);
+      const p = Math.round(pct);
+      return `<span class="rl-gauge"><span style="color:var(--muted);font-size:11px">${label}</span> `
+           + `<span class="rl-bar"><span class="rl-bar-fill ${cls}" style="width:${p}%"></span></span>`
+           + ` <span>${p}%</span>${resetStr ? ` <span class="rl-fresh">${esc(resetStr)}</span>` : ''}</span>`;
+    };
+    html = fmtGauge('5hr', cs.primary_pct, cs.primary_resets_str)
+         + ' ' + fmtGauge('7d', cs.secondary_pct, cs.secondary_resets_str);
+    if (cs.plan_type) html += ` <span class="rl-chip">${esc(cs.plan_type)}</span>`;
+    if (cs.freshness_s != null) {
+      const fs = cs.freshness_s;
+      const fsStr = fs < 60 ? `${fs}s ago` : `${Math.round(fs/60)}m ago`;
+      html += ` <span class="rl-fresh">${fsStr}</span>`;
+    }
+  }
+  const el = document.getElementById('rl-codex-content');
+  if (el) el.innerHTML = html;
+}
+
+// ── Codex pricing ──────────────────────────────────────────────────────────
+const CODEX_PRICING_JS = {
+  'gpt-5':         {in: 1.25, cached_in: 0.125, out: 10.0},
+  'gpt-5.2-codex': {in: 1.25, cached_in: 0.125, out: 10.0},
+  'gpt-5.3-codex': {in: 1.25, cached_in: 0.125, out: 10.0},
+};
+function codexCost(model, inp, cached, out) {
+  const p = CODEX_PRICING_JS[model] || CODEX_PRICING_JS['gpt-5'];
+  return ((inp - cached) * p.in + cached * p.cached_in + out * p.out) / 1e6;
+}
+
+// ── Codex tab ─────────────────────────────────────────────────────────────
+let codexCharts = {};
+function destroyCodexCharts() {
+  Object.values(codexCharts).forEach(c => { try { c.destroy(); } catch(e) {} });
+  codexCharts = {};
+}
+
+function renderCodexTab(data) {
+  destroyCodexCharts();
+  const sessions = data.codex_sessions || [];
+  const daily = data.codex_daily || [];
+  const cutoff = rangeCutoff(selectedRange);
+  const filtS = sessions.filter(s => !cutoff || s.last_date >= cutoff);
+  const filtD = daily.filter(r => !cutoff || r.day >= cutoff);
+
+  const totalCost = filtS.reduce((sum, s) => sum + codexCost(s.model, s.input, s.cache_read, s.output), 0);
+  const totalTurns = filtS.reduce((sum, s) => sum + (s.turns || 0), 0);
+  document.getElementById('codex-stats-row').innerHTML = `
+    <div class="stat-card"><div class="label">Sessions (${selectedRange})</div><div class="value">${filtS.length}</div></div>
+    <div class="stat-card"><div class="label">Turns</div><div class="value">${fmt(totalTurns)}</div></div>
+    <div class="stat-card"><div class="label">Est. Cost</div><div class="value">${fmtCost(totalCost)}</div></div>
+  `;
+
+  const days = [...new Set(filtD.map(r => r.day))].sort();
+  const models = [...new Set(filtD.map(r => r.model))];
+  const palette = ['#4f8ef7','#d97757','#4ade80','#f59e0b','#a78bfa'];
+  const datasets = models.map((m, i) => ({
+    label: m,
+    data: days.map(d => { const r = filtD.find(x => x.day===d && x.model===m); return r ? r.input + r.output : 0; }),
+    backgroundColor: palette[i % palette.length],
+  }));
+  const chartOpts = { responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#8892a4' } } },
+    scales: { x: { stacked: true, ticks: { color: '#8892a4' } }, y: { stacked: true, ticks: { color: '#8892a4' } } } };
+  const dc = document.getElementById('chart-codex-daily');
+  if (dc) codexCharts.daily = new Chart(dc, { type: 'bar', data: { labels: days, datasets }, options: chartOpts });
+
+  const byModel = {};
+  filtD.forEach(r => { byModel[r.model] = (byModel[r.model] || 0) + r.input + r.output; });
+  const mc = document.getElementById('chart-codex-model');
+  if (mc) codexCharts.model = new Chart(mc, {
+    type: 'doughnut',
+    data: { labels: Object.keys(byModel), datasets: [{ data: Object.values(byModel), backgroundColor: palette }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#8892a4' } } } }
+  });
+
+  const byProj = {};
+  filtS.forEach(s => { byProj[s.project] = (byProj[s.project] || 0) + s.input + s.output; });
+  const top5 = Object.entries(byProj).sort((a,b) => b[1]-a[1]).slice(0,5);
+  const pc = document.getElementById('chart-codex-project');
+  if (pc) codexCharts.project = new Chart(pc, {
+    type: 'bar',
+    data: { labels: top5.map(([p]) => p.length > 22 ? '…'+p.slice(-21) : p), datasets: [{ data: top5.map(([,v]) => v), backgroundColor: '#4f8ef7', label: 'Tokens' }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#8892a4' } }, y: { ticks: { color: '#8892a4' } } } }
+  });
+
+  const modelCosts = {};
+  filtS.forEach(s => {
+    if (!modelCosts[s.model]) modelCosts[s.model] = {turns:0, input:0, output:0, cache_read:0, cost:0};
+    const mc2 = modelCosts[s.model];
+    mc2.turns += s.turns||0; mc2.input += s.input||0; mc2.output += s.output||0;
+    mc2.cache_read += s.cache_read||0;
+    mc2.cost += codexCost(s.model, s.input||0, s.cache_read||0, s.output||0);
+  });
+  document.getElementById('codex-model-cost-body').innerHTML = Object.entries(modelCosts)
+    .sort((a,b) => b[1].cost - a[1].cost)
+    .map(([m, mc2]) => `<tr><td><span class="model-tag">${esc(m)}</span></td><td class="num">${fmt(mc2.turns)}</td><td class="num">${fmt(mc2.input)}</td><td class="num">${fmt(mc2.output)}</td><td class="num">${fmt(mc2.cache_read)}</td><td class="cost">${fmtCost(mc2.cost)}</td></tr>`)
+    .join('');
+
+  document.getElementById('codex-sessions-body').innerHTML = filtS.slice(0, 50)
+    .map(s => `<tr><td>${esc(s.session_id)}</td><td>${esc(s.project)}</td><td>${esc(s.last)}</td><td><span class="model-tag">${esc(s.model)}</span></td><td class="num">${s.turns||0}</td><td class="num">${fmt(s.input||0)}</td><td class="num">${fmt(s.output||0)}</td><td class="cost">${fmtCost(codexCost(s.model, s.input||0, s.cache_read||0, s.output||0))}</td></tr>`)
+    .join('');
+}
+
+// ── Combined tab ───────────────────────────────────────────────────────────
+let combinedCharts = {};
+function destroyCombinedCharts() {
+  Object.values(combinedCharts).forEach(c => { try { c.destroy(); } catch(e) {} });
+  combinedCharts = {};
+}
+
+function renderCombinedTab(data) {
+  destroyCombinedCharts();
+  const combined = data.combined_daily || [];
+  const cutoff = rangeCutoff(selectedRange);
+  const filt = combined.filter(r => !cutoff || r.day >= cutoff);
+
+  const totals = {};
+  filt.forEach(r => {
+    const p = r.provider || 'claude';
+    if (!totals[p]) totals[p] = {tokens: 0, turns: 0};
+    totals[p].tokens += (r.input||0) + (r.output||0);
+    totals[p].turns += r.turns||0;
+  });
+  const clt = totals.claude || {tokens:0, turns:0};
+  const cxt = totals.codex  || {tokens:0, turns:0};
+
+  document.getElementById('combined-stats-row').innerHTML = `
+    <div class="stat-card"><div class="label">Claude Tokens (${selectedRange})</div><div class="value">${fmt(clt.tokens)}</div></div>
+    <div class="stat-card"><div class="label">Codex Tokens (${selectedRange})</div><div class="value">${fmt(cxt.tokens)}</div></div>
+    <div class="stat-card"><div class="label">Total Turns</div><div class="value">${fmt(clt.turns + cxt.turns)}</div></div>
+  `;
+
+  const days = [...new Set(filt.map(r => r.day))].sort();
+  const claudeData = days.map(d => { const r = filt.find(x => x.day===d && x.provider==='claude'); return r ? (r.input||0)+(r.output||0) : 0; });
+  const codexData  = days.map(d => { const r = filt.find(x => x.day===d && x.provider==='codex');  return r ? (r.input||0)+(r.output||0) : 0; });
+  const dc2 = document.getElementById('chart-combined-daily');
+  if (dc2) combinedCharts.daily = new Chart(dc2, {
+    type: 'bar',
+    data: { labels: days, datasets: [
+      { label: 'Claude', data: claudeData, backgroundColor: '#d97757' },
+      { label: 'Codex',  data: codexData,  backgroundColor: '#4f8ef7' },
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8892a4' } } },
+      scales: { x: { stacked: true, ticks: { color: '#8892a4' } }, y: { stacked: true, ticks: { color: '#8892a4' } } } }
+  });
+
+  const dn = document.getElementById('chart-combined-donut');
+  if (dn) combinedCharts.donut = new Chart(dn, {
+    type: 'doughnut',
+    data: { labels: ['Claude', 'Codex'], datasets: [{ data: [clt.tokens, cxt.tokens], backgroundColor: ['#d97757','#4f8ef7'] }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#8892a4' } } } }
+  });
 }
 
 loadData();
@@ -931,10 +1382,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
-    port = port or int(os.environ.get("PORT", "8080"))
+    port = port or int(os.environ.get("PORT", "9123"))
     server = HTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
@@ -945,4 +1395,6 @@ def serve(host=None, port=None):
 
 
 if __name__ == "__main__":
-    serve()
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    serve(port)

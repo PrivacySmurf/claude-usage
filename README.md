@@ -1,4 +1,4 @@
-# Claude Code Usage Dashboard
+# AI Usage Dashboard
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
