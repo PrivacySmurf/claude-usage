@@ -1,5 +1,5 @@
 """
-cli.py - Command-line interface for the Claude Code usage dashboard.
+cli.py - Command-line interface for the AI usage dashboard.
 
 Commands:
   scan      - Scan JSONL files and update the database
@@ -76,9 +76,17 @@ def require_db():
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-def cmd_scan(projects_dir=None):
-    from scanner import scan
-    scan(projects_dir=Path(projects_dir) if projects_dir else None)
+def cmd_scan(provider=None):
+    from scanner import scan, scan_codex, PROJECTS_DIR
+    if provider == "codex":
+        print(f"Scanning Codex sessions (~/.codex/sessions/) ...")
+        scan_codex()
+    elif provider == "claude" or provider is None:
+        print(f"Scanning {PROJECTS_DIR} ...")
+        scan()
+    else:
+        print(f"Unknown provider: {provider}. Use: claude, codex")
+        sys.exit(1)
 
 
 def cmd_today():
@@ -220,7 +228,7 @@ def cmd_stats():
 
     print()
     hr("=")
-    print("  Claude Code Usage - All-Time Statistics")
+    print("  AI Usage Dashboard - All-Time Statistics")
     hr("=")
 
     first_date = (session_info["first"] or "")[:10]
@@ -260,19 +268,19 @@ def cmd_stats():
     conn.close()
 
 
-def cmd_dashboard(projects_dir=None):
+def cmd_dashboard():
     import webbrowser
     import threading
     import time
 
     print("Running scan first...")
-    cmd_scan(projects_dir=projects_dir)
+    cmd_scan()
 
-    print("\nStarting dashboard server...")
+    print("\nStarting AI Usage Dashboard server...")
     from dashboard import serve
 
     host = os.environ.get("HOST", "localhost")
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "9123"))
 
     def open_browser():
         time.sleep(1.0)
@@ -286,13 +294,15 @@ def cmd_dashboard(projects_dir=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 USAGE = """
-Claude Code Usage Dashboard
+AI Usage Dashboard
 
 Usage:
-  python cli.py scan [--projects-dir PATH]   Scan JSONL files and update database
-  python cli.py today                        Show today's usage summary
-  python cli.py stats                        Show all-time statistics
-  python cli.py dashboard [--projects-dir PATH]  Scan + start dashboard
+  python cli.py scan [--provider claude|codex]
+                       Scan JSONL files and update database
+  python cli.py today  Show today's usage summary
+  python cli.py stats  Show all-time statistics
+  python cli.py dashboard
+                       Scan + start dashboard at http://localhost:9123
 """
 
 COMMANDS = {
@@ -302,22 +312,19 @@ COMMANDS = {
     "dashboard": cmd_dashboard,
 }
 
-def parse_projects_dir(args):
-    """Extract --projects-dir value from argument list."""
-    for i, arg in enumerate(args):
-        if arg == "--projects-dir" and i + 1 < len(args):
-            return args[i + 1]
-    return None
-
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(USAGE)
         sys.exit(0)
 
-    command = sys.argv[1]
-    projects_dir = parse_projects_dir(sys.argv[2:])
-
-    if command in ("scan", "dashboard") and projects_dir:
-        COMMANDS[command](projects_dir=projects_dir)
+    cmd = sys.argv[1]
+    if cmd == "scan":
+        provider = None
+        args = sys.argv[2:]
+        if "--provider" in args:
+            idx = args.index("--provider")
+            if idx + 1 < len(args):
+                provider = args[idx + 1]
+        cmd_scan(provider=provider)
     else:
-        COMMANDS[command]()
+        COMMANDS[cmd]()
