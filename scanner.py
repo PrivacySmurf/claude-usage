@@ -863,7 +863,7 @@ def poll_gemini(conn):
                 VALUES (?, 'input', ?, ?, ?, ?)
             """, (
                 q.model_id,
-                1.0 - q.percent_left / 100.0,
+                1.0 - q.used_pct / 100.0,
                 q.reset_time,
                 q.reset_description,
                 snapshot.fetched_at,

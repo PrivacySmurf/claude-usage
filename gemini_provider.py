@@ -35,7 +35,7 @@ class GeminiApiError(Exception):
 @dataclass
 class GeminiQuota:
     model_id: str
-    percent_left: float
+    used_pct: float
     reset_time: Optional[str]
     reset_description: str
 
@@ -429,7 +429,7 @@ def parse_quota_response(data: Dict[str, Any]) -> List[GeminiQuota]:
         ordered.append(
             GeminiQuota(
                 model_id=row["label"],
-                percent_left=(1.0 - row["fraction"]) * 100.0,
+                used_pct=(1.0 - row["fraction"]) * 100.0,
                 reset_time=row["reset_time"],
                 reset_description=row["reset_desc"],
             )
