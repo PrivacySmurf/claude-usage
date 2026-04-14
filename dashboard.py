@@ -5,6 +5,7 @@ dashboard.py - Local web dashboard served on localhost:9123.
 import json
 import os
 import sqlite3
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
@@ -98,6 +99,51 @@ def get_codex_status(db_path=DB_PATH):
     return result
 
 
+def get_gemini_status(conn):
+    cursor = conn.cursor()
+    tables = {r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "gemini_quotas" not in tables or "gemini_account" not in tables:
+        return {"state": "not_configured", "hint": "Run gemini auth login"}
+
+    acct = cursor.execute(
+        "SELECT email, plan, last_state, last_error FROM gemini_account WHERE id=1"
+    ).fetchone()
+    if not acct:
+        return {"state": "not_configured", "hint": "Run gemini auth login"}
+
+    email, plan, last_state, last_error = acct
+    if last_state == "red":
+        return {"state": "error", "error": last_error or "Unknown error"}
+
+    max_ts = cursor.execute("SELECT MAX(fetched_at) FROM gemini_quotas").fetchone()[0]
+    if not max_ts:
+        return {"state": "not_configured", "hint": "No quota data yet"}
+
+    quotas = cursor.execute(
+        "SELECT model_id, remaining_fraction, reset_time_iso, reset_description "
+        "FROM gemini_quotas WHERE fetched_at=?",
+        (max_ts,),
+    ).fetchall()
+
+    result = {
+        "state": last_state or "green",
+        "plan": plan,
+        "email": email,
+        "freshness_s": int(time.time()) - max_ts,
+    }
+    for model_id, remaining_fraction, reset_time_iso, reset_description in quotas:
+        mid = (model_id or "").lower()
+        pct = round((1.0 - (remaining_fraction or 0.0)) * 100)
+        key = (
+            "flash_lite"
+            if "flash-lite" in mid or "flash_lite" in mid
+            else ("flash" if "flash" in mid else "pro")
+        )
+        result[f"{key}_pct"] = pct
+        result[f"{key}_reset"] = reset_description or ""
+    return result
+
+
 def get_dashboard_data(db_path=DB_PATH):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
@@ -177,6 +223,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    gemini_strip = get_gemini_status(conn)
     conn.close()
 
     # --- Codex data ---
@@ -270,6 +317,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":        sessions_all,
         "generated_at":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "codex_strip":         codex_strip,
+        "gemini_strip":        gemini_strip,
         "codex_daily":         codex_daily_rows,
         "codex_sessions":      codex_sessions_all,
         "combined_daily":      combined_daily_rows,
@@ -396,6 +444,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     color: var(--muted);
   }
   .chip.ok { border-color: rgba(74,222,128,0.35); color: #86efac; }
+  .chip.warn { border-color: rgba(251,191,36,0.45); color: #fcd34d; }
+  .chip.err { border-color: rgba(248,113,113,0.45); color: #fca5a5; }
   .status-placeholder {
     color: #6b7280;
     font-size: 13px;
@@ -403,6 +453,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-radius: 6px;
     padding: 10px 12px;
     line-height: 1.5;
+  }
+  .status-placeholder.warn {
+    color: #fcd34d;
+    border-color: #78350f;
+    background: rgba(120, 53, 15, 0.2);
+  }
+  .status-placeholder.error {
+    color: #fca5a5;
+    border-color: #7f1d1d;
+    background: rgba(127, 29, 29, 0.2);
   }
 
   .tab-content { display: none; }
@@ -496,7 +556,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="status-card">
     <div class="status-title">Gemini Status</div>
-    <div class="status-placeholder">Gemini: not configured - Run <code>gemini auth login</code></div>
+    <div id="gemini-strip-body" class="status-grid"></div>
+    <div class="chips" id="gemini-strip-chips"></div>
   </div>
 </div>
 
@@ -1208,6 +1269,45 @@ function renderCodexStrip(strip) {
   ].join('');
 }
 
+function renderGeminiStrip(strip) {
+  const body = document.getElementById('gemini-strip-body');
+  const chips = document.getElementById('gemini-strip-chips');
+
+  if (!strip || strip.state === 'not_configured') {
+    body.innerHTML = `<div class="status-placeholder">${esc((strip && strip.hint) || 'Run gemini auth login')}</div>`;
+    chips.innerHTML = '<span class="chip">auth: not configured</span>';
+    return;
+  }
+
+  if (strip.state === 'error') {
+    body.innerHTML = `<div class="status-placeholder error">${esc(strip.error || 'Gemini polling error')}</div>`;
+    chips.innerHTML = '<span class="chip err">auth: error</span>';
+    return;
+  }
+
+  body.innerHTML = [
+    gaugeHTML('Pro', strip.pro_pct, strip.pro_reset),
+    gaugeHTML('Flash', strip.flash_pct, strip.flash_reset),
+    gaugeHTML('Flash Lite', strip.flash_lite_pct, strip.flash_lite_reset)
+  ].join('');
+
+  const authClass = strip.state === 'yellow' ? 'warn' : 'ok';
+  const authText = strip.state === 'yellow' ? 'auth: partial' : 'auth: ok';
+  const chipsHtml = [];
+  if (strip.freshness_s !== undefined && strip.freshness_s !== null) {
+    chipsHtml.push(`<span class="chip ok">${esc(freshnessLabel(strip.freshness_s))}</span>`);
+  }
+  chipsHtml.push(`<span class="chip">${esc('Tier: ' + (strip.plan || 'Unknown'))}</span>`);
+  if (strip.email) chipsHtml.push(`<span class="chip">${esc(strip.email)}</span>`);
+  chipsHtml.push(`<span class="chip ${authClass}">${esc(authText)}</span>`);
+  chips.innerHTML = chipsHtml.join('');
+}
+
+function renderStrip(data) {
+  renderCodexStrip(data.codex_strip || {});
+  renderGeminiStrip(data.gemini_strip || {});
+}
+
 function aggregateCodexByModel(rows, cutoff=null) {
   const map = {};
   for (const r of rows || []) {
@@ -1558,7 +1658,7 @@ async function loadData() {
       initTabs();
     }
 
-    renderCodexStrip(d.codex_strip || {});
+    renderStrip(d);
     applyFilter();
   } catch (e) {
     console.error(e);

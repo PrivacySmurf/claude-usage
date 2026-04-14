@@ -84,6 +84,33 @@ By default, the scanner checks both `~/.claude/projects/` and the Xcode Claude i
 
 ---
 
+## Codex Provider
+
+Codex scanning reads local session rollouts from `~/.codex/sessions/` and updates the same usage database.
+
+```bash
+python3 cli.py scan --provider codex
+```
+
+## Gemini Provider
+
+Gemini quota polling requires Google OAuth login through the Gemini CLI.
+
+```bash
+# Authenticate Gemini CLI with OAuth personal account
+gemini auth login
+
+# Manual poll into ~/.claude/usage.db
+python3 cli.py scan --provider gemini
+
+# Optional LaunchAgent poller (every 180s)
+launchctl load ~/Library/LaunchAgents/ai.ccagents.gemini-poll.plist
+```
+
+Gemini `api-key` and `vertex-ai` auth modes are not supported for this dashboard provider.
+
+---
+
 ## How it works
 
 Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each line is a JSON record; `assistant`-type records contain:

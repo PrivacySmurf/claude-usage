@@ -77,15 +77,18 @@ def require_db():
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_scan(provider=None):
-    from scanner import scan, scan_codex, PROJECTS_DIR
+    from scanner import scan, scan_codex, scan_gemini, PROJECTS_DIR
     if provider == "codex":
         print(f"Scanning Codex sessions (~/.codex/sessions/) ...")
         scan_codex()
+    elif provider == "gemini":
+        scan_gemini(DB_PATH)
+        print("Gemini quota scan complete")
     elif provider == "claude" or provider is None:
         print(f"Scanning {PROJECTS_DIR} ...")
         scan()
     else:
-        print(f"Unknown provider: {provider}. Use: claude, codex")
+        print(f"Unknown provider: {provider}. Use: claude, codex, gemini")
         sys.exit(1)
 
 
@@ -297,7 +300,7 @@ USAGE = """
 AI Usage Dashboard
 
 Usage:
-  python cli.py scan [--provider claude|codex]
+  python cli.py scan [--provider claude|codex|gemini]
                        Scan JSONL files and update database
   python cli.py today  Show today's usage summary
   python cli.py stats  Show all-time statistics
