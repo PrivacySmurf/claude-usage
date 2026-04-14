@@ -130,6 +130,21 @@ def init_db(conn):
             fetched_at  INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS claude_rate_limits (
+            id               INTEGER PRIMARY KEY CHECK (id = 1),
+            scraped_at       INTEGER NOT NULL,
+            five_hour_pct    REAL,
+            five_hour_resets INTEGER,
+            seven_day_pct    REAL,
+            seven_day_resets INTEGER,
+            sonnet_7d_pct    REAL,
+            sonnet_7d_resets INTEGER,
+            org_id           TEXT,
+            last_state       TEXT,
+            last_error       TEXT
+        )
+    """)
     # Add message_id column if upgrading from older schema
     try:
         conn.execute("SELECT message_id FROM turns LIMIT 1")
@@ -893,12 +908,129 @@ def poll_gemini(conn):
     conn.commit()
 
 
+def poll_claude(conn):
+    """Fetch Claude rate limits from claude.ai and upsert to DB."""
+    import time, urllib.request, urllib.error, json
+    from datetime import datetime
+    from pathlib import Path
+
+    now = int(time.time())
+    cursor = conn.cursor()
+    key_file = Path.home() / ".cc-agents" / "scripts" / ".claude-session-key"
+
+    def _upsert(state, error=None, **fields):
+        cursor.execute("""
+            INSERT OR REPLACE INTO claude_rate_limits
+            (id, scraped_at, five_hour_pct, five_hour_resets, seven_day_pct, seven_day_resets,
+             sonnet_7d_pct, sonnet_7d_resets, org_id, last_state, last_error)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now,
+            fields.get("five_hour_pct"), fields.get("five_hour_resets"),
+            fields.get("seven_day_pct"), fields.get("seven_day_resets"),
+            fields.get("sonnet_7d_pct"), fields.get("sonnet_7d_resets"),
+            fields.get("org_id"), state, error
+        ))
+        conn.commit()
+
+    if not key_file.exists():
+        _upsert("not_configured")
+        return
+
+    session_key = key_file.read_text().strip()
+    headers = {
+        "Cookie": f"sessionKey={session_key}",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://claude.ai",
+        "Origin": "https://claude.ai",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
+
+    def _get(url):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return None
+
+    # Fetch org list
+    orgs = _get("https://claude.ai/api/organizations")
+    if orgs == 401:
+        _upsert("auth_error", error="Session key expired")
+        return
+    if not isinstance(orgs, list) or not orgs:
+        _upsert("red", error="Failed to fetch organizations")
+        return
+
+    org_id = orgs[0].get("id", "")
+
+    # Fetch usage
+    usage = _get(f"https://claude.ai/api/organizations/{org_id}/usage")
+    if usage == 401:
+        _upsert("auth_error", error="Session key expired", org_id=org_id)
+        return
+    if not isinstance(usage, dict):
+        _upsert("red", error="Failed to fetch usage", org_id=org_id)
+        return
+
+    def _iso_to_unix(s):
+        if not s:
+            return None
+        try:
+            return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return None
+
+    fh = usage.get("five_hour", {})
+    sd = usage.get("seven_day", {})
+    sn = usage.get("seven_day_sonnet", {})
+
+    five_hour_pct = fh.get("utilization")
+    seven_day_pct = sd.get("utilization")
+    sonnet_7d_pct = sn.get("utilization")
+
+    pcts = [p for p in [five_hour_pct, seven_day_pct, sonnet_7d_pct] if p is not None]
+    if any(p >= 95 for p in pcts):
+        state = "red"
+    elif any(p >= 80 for p in pcts):
+        state = "yellow"
+    else:
+        state = "green"
+
+    _upsert(
+        state,
+        five_hour_pct=five_hour_pct,
+        five_hour_resets=_iso_to_unix(fh.get("resets_at")),
+        seven_day_pct=seven_day_pct,
+        seven_day_resets=_iso_to_unix(sd.get("resets_at")),
+        sonnet_7d_pct=sonnet_7d_pct,
+        sonnet_7d_resets=_iso_to_unix(sn.get("resets_at")),
+        org_id=org_id,
+    )
+
+
 def scan_gemini(db_path=None):
     if db_path is None:
         db_path = Path.home() / ".claude" / "usage.db"
     conn = get_db(db_path)
     init_db(conn)
     poll_gemini(conn)
+    conn.close()
+
+
+def scan_claude_quotas(db_path=None):
+    """Thin wrapper for CLI: opens DB, calls poll_claude."""
+    import sqlite3
+    if db_path is None:
+        db_path = Path.home() / ".claude" / "usage.db"
+    conn = sqlite3.connect(str(db_path))
+    init_db(conn)
+    poll_claude(conn)
     conn.close()
 
 
