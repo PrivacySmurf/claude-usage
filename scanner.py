@@ -73,6 +73,7 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedup ON turns(session_id, timestamp, provider);
     """)
     # PR 1 migrations — idempotent ALTER TABLE + new table
     try:
@@ -520,10 +521,10 @@ def scan_codex(db_path=DB_PATH, verbose=True):
                 """, (s["session_id"], s["project_name"], s["first_timestamp"],
                       s["last_timestamp"], s["model"], s.get("provider", "codex")))
 
-        # Insert turns (with provider column)
+        # Insert turns — OR IGNORE prevents dupe rows on re-scan (dedup via unique index)
         for t in turns:
             conn.execute("""
-                INSERT INTO turns
+                INSERT OR IGNORE INTO turns
                     (session_id, timestamp, model, input_tokens, output_tokens,
                      cache_read_tokens, cache_creation_tokens, tool_name, cwd, provider)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
