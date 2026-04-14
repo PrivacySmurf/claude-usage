@@ -469,6 +469,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tab-content.active { display: block; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #filter-models, #filter-range { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
   .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
   #model-checkboxes { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -549,17 +550,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div id="filter-bar">
-  <div class="filter-label">Models</div>
-  <div id="model-checkboxes"></div>
-  <button class="filter-btn" onclick="selectAllModels()">All</button>
-  <button class="filter-btn" onclick="clearAllModels()">None</button>
-  <div class="filter-sep"></div>
-  <div class="filter-label">Range</div>
-  <div class="range-group">
-    <button class="range-btn" data-range="7d" onclick="setRange('7d')">7d</button>
-    <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
-    <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
-    <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+  <div id="filter-models">
+    <div class="filter-label">Models</div>
+    <div id="model-checkboxes"></div>
+    <button class="filter-btn" onclick="selectAllModels()">All</button>
+    <button class="filter-btn" onclick="clearAllModels()">None</button>
+    <div class="filter-sep"></div>
+  </div>
+  <div id="filter-range">
+    <div class="filter-label">Range</div>
+    <div class="range-group">
+      <button class="range-btn" data-range="7d" onclick="setRange('7d')">7d</button>
+      <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
+      <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
+      <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+    </div>
   </div>
 </div>
 
@@ -859,10 +864,18 @@ function setTab(tab, persist=true) {
   document.querySelectorAll('.tab-content').forEach(div => div.classList.toggle('active', div.id === 'tab-' + tab));
 
   const filterBar = document.getElementById('filter-bar');
+  const filterModels = document.getElementById('filter-models');
+  const filterRange = document.getElementById('filter-range');
   const codexCard = document.getElementById('codex-strip-card');
   const geminiCard = document.getElementById('gemini-strip-card');
   const strip = document.querySelector('.status-strip');
-  if (filterBar) filterBar.style.display = (tab === 'claude' || tab === 'combined') ? '' : 'none';
+  // Models filter: Claude tab + Combined only (Claude-specific)
+  if (filterModels) filterModels.style.display = (tab === 'claude' || tab === 'combined') ? '' : 'none';
+  // Range filter: all tabs
+  if (filterRange) filterRange.style.display = '';
+  // Filter bar visible whenever any child is visible (always true since range shows everywhere)
+  if (filterBar) filterBar.style.display = '';
+  // Provider strips
   if (codexCard) codexCard.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
   if (geminiCard) geminiCard.style.display = (tab === 'combined') ? '' : 'none';
   if (strip) strip.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
