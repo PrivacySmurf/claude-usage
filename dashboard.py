@@ -543,40 +543,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </header>
 
 <div class="tab-bar">
-  <button class="tab-btn active" data-tab="claude" onclick="setTab('claude')">Claude</button>
+  <button class="tab-btn active" data-tab="combined" onclick="setTab('combined')">Combined</button>
+  <button class="tab-btn" data-tab="claude" onclick="setTab('claude')">Claude</button>
   <button class="tab-btn" data-tab="codex" onclick="setTab('codex')">Codex</button>
-  <button class="tab-btn" data-tab="combined" onclick="setTab('combined')">Combined</button>
+</div>
+
+<div id="filter-bar">
+  <div class="filter-label">Models</div>
+  <div id="model-checkboxes"></div>
+  <button class="filter-btn" onclick="selectAllModels()">All</button>
+  <button class="filter-btn" onclick="clearAllModels()">None</button>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Range</div>
+  <div class="range-group">
+    <button class="range-btn" data-range="7d" onclick="setRange('7d')">7d</button>
+    <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
+    <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
+    <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
+  </div>
 </div>
 
 <div class="status-strip">
-  <div class="status-card">
+  <div class="status-card" id="codex-strip-card">
     <div class="status-title">Codex Status</div>
     <div id="codex-strip-body" class="status-grid"></div>
     <div class="chips" id="codex-strip-chips"></div>
   </div>
-  <div class="status-card">
+  <div class="status-card" id="gemini-strip-card">
     <div class="status-title">Gemini Status</div>
     <div id="gemini-strip-body" class="status-grid"></div>
     <div class="chips" id="gemini-strip-chips"></div>
   </div>
 </div>
 
-<div id="tab-claude" class="tab-content active">
-  <div id="filter-bar">
-    <div class="filter-label">Models</div>
-    <div id="model-checkboxes"></div>
-    <button class="filter-btn" onclick="selectAllModels()">All</button>
-    <button class="filter-btn" onclick="clearAllModels()">None</button>
-    <div class="filter-sep"></div>
-    <div class="filter-label">Range</div>
-    <div class="range-group">
-      <button class="range-btn" data-range="7d" onclick="setRange('7d')">7d</button>
-      <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
-      <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
-      <button class="range-btn" data-range="all" onclick="setRange('all')">All</button>
-    </div>
-  </div>
-
+<div id="tab-claude" class="tab-content">
   <div class="container">
     <div class="stats-row" id="stats-row"></div>
     <div class="charts-grid">
@@ -696,7 +696,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div id="tab-combined" class="tab-content">
+<div id="tab-combined" class="tab-content active">
   <div class="container">
     <div class="stats-row" id="combined-stats-row"></div>
     <div class="charts-grid">
@@ -743,7 +743,7 @@ let rawData = null;
 window._data = null;
 let selectedModels = new Set();
 let selectedRange = '30d';
-let selectedTab = 'claude';
+let selectedTab = 'combined';
 let charts = {};
 let sessionSortCol = 'last';
 let sessionSortDir = 'desc';
@@ -857,12 +857,22 @@ function setTab(tab, persist=true) {
   selectedTab = tab;
   document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
   document.querySelectorAll('.tab-content').forEach(div => div.classList.toggle('active', div.id === 'tab-' + tab));
+
+  const filterBar = document.getElementById('filter-bar');
+  const codexCard = document.getElementById('codex-strip-card');
+  const geminiCard = document.getElementById('gemini-strip-card');
+  const strip = document.querySelector('.status-strip');
+  if (filterBar) filterBar.style.display = (tab === 'claude' || tab === 'combined') ? '' : 'none';
+  if (codexCard) codexCard.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
+  if (geminiCard) geminiCard.style.display = (tab === 'combined') ? '' : 'none';
+  if (strip) strip.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
+
   if (persist) localStorage.setItem('aidash_tab', tab);
 }
 
 function initTabs() {
   const saved = localStorage.getItem('aidash_tab');
-  setTab(saved || 'claude', false);
+  setTab(saved || 'combined', false);
 }
 
 function modelPriority(m) {
