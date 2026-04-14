@@ -99,6 +99,58 @@ def get_codex_status(db_path=DB_PATH):
     return result
 
 
+def get_claude_status(conn):
+    """Read claude_rate_limits table and return strip dict."""
+    import time as _time
+    cursor = conn.cursor()
+    tables = {r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "claude_rate_limits" not in tables:
+        return {"state": "not_configured", "hint": "Add session key to ~/.cc-agents/scripts/.claude-session-key"}
+
+    row = cursor.execute(
+        "SELECT scraped_at, five_hour_pct, five_hour_resets, seven_day_pct, seven_day_resets, "
+        "sonnet_7d_pct, sonnet_7d_resets, org_id, last_state, last_error FROM claude_rate_limits WHERE id=1"
+    ).fetchone()
+    if not row:
+        return {"state": "not_configured", "hint": "Add session key to ~/.cc-agents/scripts/.claude-session-key"}
+
+    scraped_at, fh_pct, fh_resets, sd_pct, sd_resets, sn_pct, sn_resets, org_id, state, last_error = row
+
+    def _resets_str(unix_ts):
+        if not unix_ts:
+            return ""
+        delta = int(unix_ts - _time.time())
+        if delta <= 0:
+            return "Resets soon"
+        h, rem = divmod(delta, 3600)
+        m = rem // 60
+        return f"in {h}h {m}m" if h > 0 else f"in {m}m"
+
+    result = {
+        "state": state or "not_configured",
+        "freshness_s": int(_time.time()) - scraped_at if scraped_at else None,
+        "org_id_short": (org_id or "")[-6:] or None,
+        "last_error": last_error,
+    }
+
+    if state in ("not_configured",):
+        result["hint"] = "Add session key to ~/.cc-agents/scripts/.claude-session-key"
+    elif state == "auth_error":
+        result["hint"] = "Session key expired — refresh from claude.ai cookies"
+
+    if fh_pct is not None:
+        result["five_hour_pct"] = round(fh_pct)
+        result["five_hour_resets_str"] = _resets_str(fh_resets)
+    if sd_pct is not None:
+        result["seven_day_pct"] = round(sd_pct)
+        result["seven_day_resets_str"] = _resets_str(sd_resets)
+    if sn_pct is not None:
+        result["sonnet_7d_pct"] = round(sn_pct)
+        result["sonnet_7d_resets_str"] = _resets_str(sn_resets)
+
+    return result
+
+
 def get_gemini_status(conn):
     cursor = conn.cursor()
     tables = {r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -224,6 +276,7 @@ def get_dashboard_data(db_path=DB_PATH):
         })
 
     gemini_strip = get_gemini_status(conn)
+    claude_strip = get_claude_status(conn)
     conn.close()
 
     # --- Codex data ---
@@ -318,6 +371,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "generated_at":        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "codex_strip":         codex_strip,
         "gemini_strip":        gemini_strip,
+        "claude_strip":        claude_strip,
         "codex_daily":         codex_daily_rows,
         "codex_sessions":      codex_sessions_all,
         "combined_daily":      combined_daily_rows,
@@ -446,6 +500,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chip.ok { border-color: rgba(74,222,128,0.35); color: #86efac; }
   .chip.warn { border-color: rgba(251,191,36,0.45); color: #fcd34d; }
   .chip.err { border-color: rgba(248,113,113,0.45); color: #fca5a5; }
+  .chip-red { border-color: rgba(248,113,113,0.45); color: #fca5a5; }
+  .chip-yellow { border-color: rgba(251,191,36,0.45); color: #fcd34d; }
+  .chip-green { border-color: rgba(74,222,128,0.35); color: #86efac; }
+  .chip-gray { color: var(--muted); }
   .status-placeholder {
     color: #6b7280;
     font-size: 13px;
@@ -578,6 +636,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="status-title">Gemini Status</div>
     <div id="gemini-strip-body" class="status-grid"></div>
     <div class="chips" id="gemini-strip-chips"></div>
+  </div>
+  <div class="status-card" id="claude-strip-card">
+    <div class="status-title">Claude Status</div>
+    <div id="claude-strip-body" class="status-grid"></div>
+    <div class="chips" id="claude-strip-chips"></div>
   </div>
 </div>
 
@@ -868,6 +931,7 @@ function setTab(tab, persist=true) {
   const filterRange = document.getElementById('filter-range');
   const codexCard = document.getElementById('codex-strip-card');
   const geminiCard = document.getElementById('gemini-strip-card');
+  const claudeCard = document.getElementById('claude-strip-card');
   const strip = document.querySelector('.status-strip');
   // Models filter: Claude tab only (Claude-specific)
   if (filterModels) filterModels.style.display = (tab === 'claude') ? '' : 'none';
@@ -878,7 +942,10 @@ function setTab(tab, persist=true) {
   // Provider strips
   if (codexCard) codexCard.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
   if (geminiCard) geminiCard.style.display = (tab === 'combined') ? '' : 'none';
-  if (strip) strip.style.display = (tab === 'codex' || tab === 'combined') ? '' : 'none';
+  if (claudeCard) {
+    claudeCard.style.display = (tab === 'claude' || tab === 'combined') ? '' : 'none';
+  }
+  if (strip) strip.style.display = (tab === 'claude' || tab === 'codex' || tab === 'combined') ? '' : 'none';
 
   if (persist) localStorage.setItem('aidash_tab', tab);
 }
@@ -1326,9 +1393,37 @@ function renderGeminiStrip(strip) {
   chips.innerHTML = chipsHtml.join('');
 }
 
+function renderClaudeStrip(strip) {
+  const body = document.getElementById('claude-strip-body');
+  const chips = document.getElementById('claude-strip-chips');
+  if (!body || !chips) return;
+  const state = strip.state || 'not_configured';
+
+  if (state === 'not_configured' || state === 'auth_error') {
+    body.innerHTML = `<div class="status-placeholder">${strip.hint || 'Not configured'}</div>`;
+    const color = state === 'auth_error' ? 'chip-red' : 'chip-gray';
+    chips.innerHTML = `<span class="chip ${color}">${state === 'auth_error' ? 'Auth Error' : 'Not configured'}</span>`;
+    return;
+  }
+
+  const gauges = [
+    { label: '5hr Window', pct: strip.five_hour_pct, sub: strip.five_hour_resets_str },
+    { label: '7d Window',  pct: strip.seven_day_pct,  sub: strip.seven_day_resets_str },
+    { label: 'Sonnet 7d',  pct: strip.sonnet_7d_pct,  sub: strip.sonnet_7d_resets_str },
+  ];
+  body.innerHTML = gauges.map(g => gaugeHTML(g.label, g.pct ?? 0, g.sub || '')).join('');
+
+  const authColor = state === 'red' ? 'chip-red' : state === 'yellow' ? 'chip-yellow' : 'chip-green';
+  let chipsHtml = `<span class="chip ${authColor}">${state.charAt(0).toUpperCase() + state.slice(1)}</span>`;
+  if (strip.org_id_short) chipsHtml += `<span class="chip chip-gray">org \u2026${strip.org_id_short}</span>`;
+  if (strip.freshness_s != null) chipsHtml += `<span class="chip chip-gray">${strip.freshness_s}s ago</span>`;
+  chips.innerHTML = chipsHtml;
+}
+
 function renderStrip(data) {
   renderCodexStrip(data.codex_strip || {});
   renderGeminiStrip(data.gemini_strip || {});
+  renderClaudeStrip(data.claude_strip || {});
 }
 
 function aggregateCodexByModel(rows, cutoff=null) {
@@ -1725,7 +1820,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Full rebuild: delete DB and rescan from scratch (all providers)
             if DB_PATH.exists():
                 DB_PATH.unlink()
-            from scanner import scan, scan_codex, scan_gemini
+            from scanner import scan, scan_codex, scan_gemini, scan_claude_quotas
             result = scan(verbose=False)
             try:
                 codex_result = scan_codex(verbose=False)
@@ -1737,6 +1832,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result["gemini"] = "ok"
             except Exception as e:
                 result["gemini_error"] = str(e)
+            try:
+                scan_claude_quotas(DB_PATH)
+                result["claude_quotas"] = "ok"
+            except Exception as e:
+                result["claude_quotas_error"] = str(e)
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
