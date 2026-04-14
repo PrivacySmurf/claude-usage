@@ -21,8 +21,7 @@ CODEX_PRICING = {
     "gpt-5.3-codex": {"in": 1.25, "cached_in": 0.125, "out": 10.0},
 }
 CODEX_MODEL_ALIASES = {
-    "gpt-5-codex":   "gpt-5",
-    "gpt-5.3-codex": "gpt-5.2-codex",
+    "gpt-5-codex": "gpt-5",
 }
 
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
