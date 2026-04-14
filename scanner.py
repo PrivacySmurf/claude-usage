@@ -108,6 +108,28 @@ def init_db(conn):
             source_ts           INTEGER
         )
     """)
+    # PR 2: Gemini tables
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gemini_quotas (
+            model_id            TEXT NOT NULL,
+            token_type          TEXT NOT NULL,
+            remaining_fraction  REAL NOT NULL,
+            reset_time_iso      TEXT,
+            reset_description   TEXT,
+            fetched_at          INTEGER NOT NULL,
+            PRIMARY KEY (model_id, token_type)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gemini_account (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            email       TEXT,
+            plan        TEXT,
+            last_state  TEXT,
+            last_error  TEXT,
+            fetched_at  INTEGER NOT NULL
+        )
+    """)
     # Add message_id column if upgrading from older schema
     try:
         conn.execute("SELECT message_id FROM turns LIMIT 1")
@@ -815,6 +837,67 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     conn.close()
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
             "turns": total_turns, "sessions": len(total_sessions)}
+
+
+def poll_gemini(conn):
+    from gemini_provider import (
+        fetch,
+        GeminiUnsupportedAuth,
+        GeminiNotLoggedIn,
+        GeminiNotInstalled,
+        GeminiApiError,
+    )
+    import time
+
+    now = int(time.time())
+    cursor = conn.cursor()
+    try:
+        snapshot = fetch()
+        state = "green" if snapshot.account_plan is not None else "yellow"
+        error = None
+
+        for q in snapshot.quotas:
+            cursor.execute("""
+                INSERT OR REPLACE INTO gemini_quotas
+                (model_id, token_type, remaining_fraction, reset_time_iso, reset_description, fetched_at)
+                VALUES (?, 'input', ?, ?, ?, ?)
+            """, (
+                q.model_id,
+                1.0 - q.used_pct / 100.0,
+                q.reset_time,
+                q.reset_description,
+                snapshot.fetched_at,
+            ))
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO gemini_account (id, email, plan, last_state, last_error, fetched_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+        """, (snapshot.account_email, snapshot.account_plan, state, error, snapshot.fetched_at))
+    except GeminiUnsupportedAuth:
+        cursor.execute("""
+            INSERT OR REPLACE INTO gemini_account (id, email, plan, last_state, last_error, fetched_at)
+            VALUES (1, NULL, NULL, 'red', 'Use Google account (OAuth)', ?)
+        """, (now,))
+    except GeminiNotLoggedIn:
+        cursor.execute("""
+            INSERT OR REPLACE INTO gemini_account (id, email, plan, last_state, last_error, fetched_at)
+            VALUES (1, NULL, NULL, 'red', 'Run gemini auth login', ?)
+        """, (now,))
+    except (GeminiNotInstalled, GeminiApiError) as exc:
+        cursor.execute("""
+            INSERT OR REPLACE INTO gemini_account (id, email, plan, last_state, last_error, fetched_at)
+            VALUES (1, NULL, NULL, 'red', ?, ?)
+        """, (str(exc), now))
+    conn.commit()
+
+
+def scan_gemini(db_path=None):
+    if db_path is None:
+        db_path = Path.home() / ".claude" / "usage.db"
+    conn = get_db(db_path)
+    init_db(conn)
+    poll_gemini(conn)
+    conn.close()
 
 
 if __name__ == "__main__":
