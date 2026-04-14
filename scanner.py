@@ -73,7 +73,6 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedup ON turns(session_id, timestamp, provider);
     """)
     # PR 1 migrations — idempotent ALTER TABLE + new table
     try:
@@ -86,6 +85,10 @@ def init_db(conn):
         pass
     try:
         conn.execute("ALTER TABLE processed_files ADD COLUMN provider TEXT DEFAULT 'claude'")
+    except Exception:
+        pass
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_turns_dedup")
     except Exception:
         pass
 
