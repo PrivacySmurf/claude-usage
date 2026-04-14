@@ -1738,6 +1738,9 @@ def serve(host=None, port=None):
 
 
 if __name__ == "__main__":
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9123
-    serve(port=port)
+    import sys, argparse
+    parser = argparse.ArgumentParser(description="AI Usage Dashboard")
+    parser.add_argument("port", nargs="?", type=int, default=9123)
+    parser.add_argument("--host", default=None, help="Bind host (default: localhost or HOST env var)")
+    args = parser.parse_args()
+    serve(port=args.port, host=args.host)

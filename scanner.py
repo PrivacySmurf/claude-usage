@@ -439,7 +439,7 @@ def scan_codex(db_path=DB_PATH, verbose=True):
                         if payload.get("type") != "token_count":
                             continue
 
-                        info = record.get("info", {})
+                        info = payload.get("info") or {}
                         ts_str = record.get("timestamp", "")
                         sid = record.get("session_id") or record.get("sessionId")
 
@@ -581,10 +581,12 @@ def scan_codex(db_path=DB_PATH, verbose=True):
         secondary = rl.get("secondary", {})
         credits = rl.get("credits", {})
 
-        # primary_resets_at: parse ISO string
+        # primary_resets_at: parse ISO string or pass through Unix int
         def _parse_resets(val):
             if not val:
                 return None
+            if isinstance(val, int):
+                return val
             try:
                 return int(datetime.fromisoformat(str(val).replace("Z", "+00:00")).timestamp())
             except Exception:
@@ -599,10 +601,10 @@ def scan_codex(db_path=DB_PATH, verbose=True):
         """, (
             int(datetime.now().timestamp()),
             primary.get("used_percent"),
-            primary.get("window"),
+            primary.get("window_minutes"),
             _parse_resets(primary.get("resets_at")),
             secondary.get("used_percent"),
-            secondary.get("window"),
+            secondary.get("window_minutes"),
             _parse_resets(secondary.get("resets_at")),
             rl.get("plan_type"),
             1 if credits.get("has_credits") else 0,
