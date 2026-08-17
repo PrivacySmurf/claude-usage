@@ -307,7 +307,13 @@ def aggregate_sessions(session_metas, turns):
 
 
 def upsert_sessions(conn, sessions):
+    seen_session_ids = set()
     for s in sessions:
+        session_id = s["session_id"]
+        if session_id in seen_session_ids:
+            continue
+        seen_session_ids.add(session_id)
+
         # Check if session exists
         existing = conn.execute(
             "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
@@ -909,14 +915,21 @@ def poll_gemini(conn):
 
 
 def poll_claude(conn):
-    """Fetch Claude rate limits from claude.ai and upsert to DB."""
-    import time, urllib.request, urllib.error, json
+    """Fetch Claude rate limits from claude.ai and upsert to DB.
+
+    Strategy: try curl_cffi (Chrome TLS impersonation) first, fall back to
+    reading the cached JSON file written by the browser agent.
+    """
+    import time, json
     from datetime import datetime
     from pathlib import Path
 
     now = int(time.time())
     cursor = conn.cursor()
     key_file = Path.home() / ".cc-agents" / "scripts" / ".claude-session-key"
+    cf_file = Path.home() / ".cc-agents" / "scripts" / ".claude-cf-clearance"
+    cache_file = Path.home() / ".cc-agents" / "scripts" / ".claude-usage-latest.json"
+    org_id = "0a1cd8f0-13d0-48e4-9847-657c0107bbad"
 
     def _upsert(state, error=None, **fields):
         cursor.execute("""
@@ -933,52 +946,42 @@ def poll_claude(conn):
         ))
         conn.commit()
 
-    if not key_file.exists():
-        _upsert("not_configured")
-        return
+    usage = None
 
-    session_key = key_file.read_text().strip()
-    if not session_key:
-        _upsert("not_configured")
-        return
-    headers = {
-        "Cookie": f"sessionKey={session_key}",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://claude.ai",
-        "Origin": "https://claude.ai",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    }
+    # Strategy 1: curl_cffi with Chrome TLS impersonation
+    if key_file.exists() and cf_file.exists():
+        session_key = key_file.read_text().strip()
+        cf_clearance = cf_file.read_text().strip()
+        if session_key and cf_clearance:
+            try:
+                from curl_cffi import requests as cffi_requests
+                resp = cffi_requests.get(
+                    f"https://claude.ai/api/organizations/{org_id}/usage",
+                    cookies={"sessionKey": session_key, "cf_clearance": cf_clearance},
+                    headers={"Accept": "application/json", "Referer": "https://claude.ai", "Origin": "https://claude.ai"},
+                    impersonate="chrome",
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    usage = resp.json()
+                    cache_file.write_text(json.dumps(usage))
+                elif resp.status_code == 401:
+                    _upsert("auth_error", error="Session key expired", org_id=org_id)
+                    return
+            except Exception:
+                pass
 
-    def _get(url):
-        req = urllib.request.Request(url, headers=headers)
+    # Strategy 2: read cached JSON from browser agent
+    if usage is None and cache_file.exists():
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            return e.code
+            age = now - int(cache_file.stat().st_mtime)
+            if age < 14400:  # accept cache up to 4 hours old
+                usage = json.loads(cache_file.read_text())
         except Exception:
-            return None
+            pass
 
-    # Fetch org list
-    orgs = _get("https://claude.ai/api/organizations")
-    if orgs == 401:
-        _upsert("auth_error", error="Session key expired")
-        return
-    if not isinstance(orgs, list) or not orgs:
-        _upsert("red", error="Failed to fetch organizations")
-        return
-
-    org_id = orgs[0].get("id", "")
-
-    # Fetch usage
-    usage = _get(f"https://claude.ai/api/organizations/{org_id}/usage")
-    if usage == 401:
-        _upsert("auth_error", error="Session key expired", org_id=org_id)
-        return
     if not isinstance(usage, dict):
-        _upsert("red", error="Failed to fetch usage", org_id=org_id)
+        _upsert("red", error="Failed to fetch usage (curl_cffi + cache both failed)", org_id=org_id)
         return
 
     def _iso_to_unix(s):
@@ -989,15 +992,22 @@ def poll_claude(conn):
         except Exception:
             return None
 
-    fh = usage.get("five_hour", {})
-    sd = usage.get("seven_day", {})
-    sn = usage.get("seven_day_sonnet", {})
+    fh = usage.get("five_hour") or {}
+    sd = usage.get("seven_day") or {}
+    sn = usage.get("seven_day_sonnet") or {}
 
     five_hour_pct = fh.get("utilization")
     seven_day_pct = sd.get("utilization")
     sonnet_7d_pct = sn.get("utilization")
 
     pcts = [p for p in [five_hour_pct, seven_day_pct, sonnet_7d_pct] if p is not None]
+    if not pcts:
+        _upsert(
+            "red",
+            error="Usage response contained no utilization values",
+            org_id=org_id,
+        )
+        return
     if any(p >= 95 for p in pcts):
         state = "red"
     elif any(p >= 80 for p in pcts):
