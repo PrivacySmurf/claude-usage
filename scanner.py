@@ -307,7 +307,13 @@ def aggregate_sessions(session_metas, turns):
 
 
 def upsert_sessions(conn, sessions):
+    seen_session_ids = set()
     for s in sessions:
+        session_id = s["session_id"]
+        if session_id in seen_session_ids:
+            continue
+        seen_session_ids.add(session_id)
+
         # Check if session exists
         existing = conn.execute(
             "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
@@ -986,15 +992,22 @@ def poll_claude(conn):
         except Exception:
             return None
 
-    fh = usage.get("five_hour", {})
-    sd = usage.get("seven_day", {})
-    sn = usage.get("seven_day_sonnet", {})
+    fh = usage.get("five_hour") or {}
+    sd = usage.get("seven_day") or {}
+    sn = usage.get("seven_day_sonnet") or {}
 
     five_hour_pct = fh.get("utilization")
     seven_day_pct = sd.get("utilization")
     sonnet_7d_pct = sn.get("utilization")
 
     pcts = [p for p in [five_hour_pct, seven_day_pct, sonnet_7d_pct] if p is not None]
+    if not pcts:
+        _upsert(
+            "red",
+            error="Usage response contained no utilization values",
+            org_id=org_id,
+        )
+        return
     if any(p >= 95 for p in pcts):
         state = "red"
     elif any(p >= 80 for p in pcts):
