@@ -6,10 +6,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
-    aggregate_sessions, upsert_sessions, insert_turns, scan,
+    aggregate_sessions, upsert_sessions, insert_turns, scan, poll_claude,
 )
 
 
@@ -414,6 +415,48 @@ class TestDatabaseOperations(unittest.TestCase):
         row = self.conn.execute("SELECT * FROM sessions WHERE session_id = 's1'").fetchone()
         self.assertEqual(row["total_input_tokens"], 1200)  # 1000 + 200
         self.assertEqual(row["turn_count"], 7)  # 5 + 2
+
+    def test_upsert_ignores_duplicate_session_summary_in_same_batch(self):
+        session = {
+            "session_id": "s1", "project_name": "test",
+            "first_timestamp": "2026-04-08T09:00:00Z",
+            "last_timestamp": "2026-04-08T10:00:00Z",
+            "git_branch": "main", "model": "claude-sonnet-4-6",
+            "total_input_tokens": 1000, "total_output_tokens": 500,
+            "total_cache_read": 100, "total_cache_creation": 50,
+            "turn_count": 5,
+        }
+
+        upsert_sessions(self.conn, [session, dict(session)])
+
+        row = self.conn.execute("SELECT * FROM sessions WHERE session_id = 's1'").fetchone()
+        self.assertEqual(row["total_input_tokens"], 1000)
+        self.assertEqual(row["total_output_tokens"], 500)
+        self.assertEqual(row["turn_count"], 5)
+
+    def test_null_quota_windows_fail_closed_instead_of_false_green(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ".claude-usage-latest.json").write_text(json.dumps({
+                "five_hour": None,
+                "seven_day": None,
+                "seven_day_sonnet": None,
+            }))
+
+            with mock.patch("pathlib.Path.home", return_value=home):
+                poll_claude(self.conn)
+
+        row = self.conn.execute(
+            "SELECT last_state, last_error, five_hour_pct, seven_day_pct, sonnet_7d_pct "
+            "FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "red")
+        self.assertEqual(row["last_error"], "Usage response contained no utilization values")
+        self.assertIsNone(row["five_hour_pct"])
+        self.assertIsNone(row["seven_day_pct"])
+        self.assertIsNone(row["sonnet_7d_pct"])
 
     def test_insert_turns(self):
         turns = [{
