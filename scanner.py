@@ -970,14 +970,20 @@ def poll_claude(conn):
     usage = None
     source_timestamp = now
     live_error = None
+    live_cache_payload = None
     cache_error = None
     cache_max_age_seconds = 300
 
     # Strategy 1: discover the authenticated organization, then fetch usage.
     if key_file.exists() and cf_file.exists():
-        session_key = key_file.read_text().strip()
-        cf_clearance = cf_file.read_text().strip()
-        if session_key and cf_clearance:
+        session_key = None
+        cf_clearance = None
+        try:
+            session_key = key_file.read_text().strip()
+            cf_clearance = cf_file.read_text().strip()
+        except Exception:
+            live_error = "Live usage fetch failed"
+        if live_error is None and session_key and cf_clearance:
             try:
                 from curl_cffi import requests as cffi_requests
 
@@ -1024,10 +1030,10 @@ def poll_claude(conn):
                                 return
                             if usage_response.status_code == 200:
                                 usage = usage_response.json()
-                                cache_file.write_text(json.dumps({
+                                live_cache_payload = {
                                     "org_id": org_id,
                                     "usage": usage,
-                                }))
+                                }
                             else:
                                 live_error = f"Failed to fetch usage (HTTP {usage_response.status_code})"
             except Exception:
@@ -1093,13 +1099,16 @@ def poll_claude(conn):
     sonnet_7d_pct = sn.get("utilization")
 
     raw_pcts = [five_hour_pct, seven_day_pct, sonnet_7d_pct]
+    def _usable_pct(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+        return 0 <= value <= 100
+
     invalid_pcts = [
         p for p in raw_pcts
-        if p is not None and (
-            isinstance(p, bool)
-            or not isinstance(p, (int, float))
-            or not math.isfinite(p)
-        )
+        if p is not None and not _usable_pct(p)
     ]
     if invalid_pcts:
         _upsert(
@@ -1125,6 +1134,12 @@ def poll_claude(conn):
         state = "yellow"
     else:
         state = "green"
+
+    if live_cache_payload is not None:
+        try:
+            cache_file.write_text(json.dumps(live_cache_payload))
+        except Exception:
+            pass
 
     _upsert(
         state,

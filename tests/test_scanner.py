@@ -721,6 +721,98 @@ class TestDatabaseOperations(unittest.TestCase):
                 )
                 self.assertIsNone(row["five_hour_pct"])
 
+    def test_credential_read_error_replaces_prior_green_with_red(self):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO claude_rate_limits "
+            "(id, scraped_at, five_hour_pct, last_state) VALUES (1, 1, 1.0, 'green')"
+        )
+        self.conn.commit()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ".claude-session-key").mkdir()
+            (scripts_dir / ".claude-cf-clearance").write_text("fixture-clearance")
+
+            with mock.patch("pathlib.Path.home", return_value=home):
+                poll_claude(self.conn)
+
+        row = self.conn.execute(
+            "SELECT last_state, last_error, five_hour_pct "
+            "FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "red")
+        self.assertEqual(row["last_error"], "Live usage fetch failed")
+        self.assertIsNone(row["five_hour_pct"])
+
+    def test_out_of_range_and_huge_utilization_values_fail_closed(self):
+        invalid_values = [-0.1, 100.1, 10 ** 1000]
+        for value in invalid_values:
+            with self.subTest(value=repr(value)), tempfile.TemporaryDirectory() as tmpdir:
+                home = Path(tmpdir)
+                scripts_dir = home / ".cc-agents" / "scripts"
+                scripts_dir.mkdir(parents=True)
+                (scripts_dir / ".claude-usage-latest.json").write_text(json.dumps({
+                    "five_hour": {"utilization": value},
+                }))
+
+                with mock.patch("pathlib.Path.home", return_value=home):
+                    poll_claude(self.conn)
+
+                row = self.conn.execute(
+                    "SELECT last_state, last_error, five_hour_pct "
+                    "FROM claude_rate_limits WHERE id = 1"
+                ).fetchone()
+                self.assertEqual(row["last_state"], "red")
+                self.assertEqual(
+                    row["last_error"],
+                    "Usage response contained invalid utilization values",
+                )
+                self.assertIsNone(row["five_hour_pct"])
+
+    def test_invalid_live_payload_does_not_overwrite_known_good_cache(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kwargs):
+            if url == "https://claude.ai/api/organizations":
+                return FakeResponse(200, [{"uuid": "org-from-account"}])
+            return FakeResponse(200, {"five_hour": {"utilization": "invalid"}})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ".claude-session-key").write_text("fixture-session")
+            (scripts_dir / ".claude-cf-clearance").write_text("fixture-clearance")
+            cache_file = scripts_dir / ".claude-usage-latest.json"
+            original_cache = json.dumps({"five_hour": {"utilization": 23.0}})
+            cache_file.write_text(original_cache)
+            fake_module = types.SimpleNamespace(
+                requests=types.SimpleNamespace(get=fake_get)
+            )
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch.dict("sys.modules", {"curl_cffi": fake_module}):
+                poll_claude(self.conn)
+
+            self.assertEqual(cache_file.read_text(), original_cache)
+
+        row = self.conn.execute(
+            "SELECT last_state, last_error FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "red")
+        self.assertEqual(
+            row["last_error"],
+            "Usage response contained invalid utilization values",
+        )
+
     def test_fresh_enveloped_cache_restores_dynamic_organization(self):
         now = 1_000_000
         with tempfile.TemporaryDirectory() as tmpdir:
