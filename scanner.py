@@ -307,13 +307,34 @@ def aggregate_sessions(session_metas, turns):
 
 
 def upsert_sessions(conn, sessions):
-    seen_session_ids = set()
-    for s in sessions:
-        session_id = s["session_id"]
-        if session_id in seen_session_ids:
+    coalesced = {}
+    for session in sessions:
+        session_id = session["session_id"]
+        current = coalesced.get(session_id)
+        if current is None:
+            coalesced[session_id] = dict(session)
             continue
-        seen_session_ids.add(session_id)
+        if current == session:
+            continue
 
+        current["first_timestamp"] = min(
+            current["first_timestamp"], session["first_timestamp"]
+        )
+        current["last_timestamp"] = max(
+            current["last_timestamp"], session["last_timestamp"]
+        )
+        for field in (
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_cache_read",
+            "total_cache_creation",
+            "turn_count",
+        ):
+            current[field] += session[field]
+        if session.get("model"):
+            current["model"] = session["model"]
+
+    for s in coalesced.values():
         # Check if session exists
         existing = conn.execute(
             "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
@@ -920,7 +941,7 @@ def poll_claude(conn):
     Strategy: try curl_cffi (Chrome TLS impersonation) first, fall back to
     reading the cached JSON file written by the browser agent.
     """
-    import time, json
+    import time, json, math
     from datetime import datetime
     from pathlib import Path
 
@@ -929,16 +950,16 @@ def poll_claude(conn):
     key_file = Path.home() / ".cc-agents" / "scripts" / ".claude-session-key"
     cf_file = Path.home() / ".cc-agents" / "scripts" / ".claude-cf-clearance"
     cache_file = Path.home() / ".cc-agents" / "scripts" / ".claude-usage-latest.json"
-    org_id = "0a1cd8f0-13d0-48e4-9847-657c0107bbad"
+    org_id = None
 
-    def _upsert(state, error=None, **fields):
+    def _upsert(state, error=None, scraped_at=None, **fields):
         cursor.execute("""
             INSERT OR REPLACE INTO claude_rate_limits
             (id, scraped_at, five_hour_pct, five_hour_resets, seven_day_pct, seven_day_resets,
              sonnet_7d_pct, sonnet_7d_resets, org_id, last_state, last_error)
             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            now,
+            now if scraped_at is None else scraped_at,
             fields.get("five_hour_pct"), fields.get("five_hour_resets"),
             fields.get("seven_day_pct"), fields.get("seven_day_resets"),
             fields.get("sonnet_7d_pct"), fields.get("sonnet_7d_resets"),
@@ -947,38 +968,97 @@ def poll_claude(conn):
         conn.commit()
 
     usage = None
+    source_timestamp = now
+    live_error = None
+    cache_error = None
+    cache_max_age_seconds = 300
 
-    # Strategy 1: curl_cffi with Chrome TLS impersonation
+    # Strategy 1: discover the authenticated organization, then fetch usage.
     if key_file.exists() and cf_file.exists():
         session_key = key_file.read_text().strip()
         cf_clearance = cf_file.read_text().strip()
         if session_key and cf_clearance:
             try:
                 from curl_cffi import requests as cffi_requests
-                resp = cffi_requests.get(
-                    f"https://claude.ai/api/organizations/{org_id}/usage",
-                    cookies={"sessionKey": session_key, "cf_clearance": cf_clearance},
-                    headers={"Accept": "application/json", "Referer": "https://claude.ai", "Origin": "https://claude.ai"},
-                    impersonate="chrome",
-                    timeout=15,
+
+                request_kwargs = {
+                    "cookies": {"sessionKey": session_key, "cf_clearance": cf_clearance},
+                    "headers": {
+                        "Accept": "application/json",
+                        "Referer": "https://claude.ai",
+                        "Origin": "https://claude.ai",
+                    },
+                    "impersonate": "chrome",
+                    "timeout": 15,
+                }
+                org_response = cffi_requests.get(
+                    "https://claude.ai/api/organizations",
+                    **request_kwargs,
                 )
-                if resp.status_code == 200:
-                    usage = resp.json()
-                    cache_file.write_text(json.dumps(usage))
-                elif resp.status_code == 401:
-                    _upsert("auth_error", error="Session key expired", org_id=org_id)
+                if org_response.status_code == 401:
+                    _upsert("auth_error", error="Session key expired")
                     return
+                if org_response.status_code != 200:
+                    live_error = f"Failed to fetch organizations (HTTP {org_response.status_code})"
+                else:
+                    organizations = org_response.json()
+                    if not isinstance(organizations, list) or not organizations:
+                        live_error = "Failed to fetch organizations"
+                    else:
+                        organization = organizations[0]
+                        if not isinstance(organization, dict):
+                            live_error = "Organization response contained no usable id"
+                            candidate_org_id = None
+                        else:
+                            candidate_org_id = organization.get("uuid") or organization.get("id")
+                        if not isinstance(candidate_org_id, str) or not candidate_org_id:
+                            live_error = "Organization response contained no usable id"
+                        else:
+                            org_id = candidate_org_id
+                            usage_response = cffi_requests.get(
+                                f"https://claude.ai/api/organizations/{org_id}/usage",
+                                **request_kwargs,
+                            )
+                            if usage_response.status_code == 401:
+                                _upsert("auth_error", error="Session key expired", org_id=org_id)
+                                return
+                            if usage_response.status_code == 200:
+                                usage = usage_response.json()
+                                cache_file.write_text(json.dumps({
+                                    "org_id": org_id,
+                                    "usage": usage,
+                                }))
+                            else:
+                                live_error = f"Failed to fetch usage (HTTP {usage_response.status_code})"
             except Exception:
-                pass
+                live_error = "Live usage fetch failed"
 
     # Strategy 2: read cached JSON from browser agent
     if usage is None and cache_file.exists():
         try:
-            age = now - int(cache_file.stat().st_mtime)
-            if age < 14400:  # accept cache up to 4 hours old
-                usage = json.loads(cache_file.read_text())
+            cache_mtime = int(cache_file.stat().st_mtime)
+            age = now - cache_mtime
+            if 0 <= age <= cache_max_age_seconds:
+                cached_payload = json.loads(cache_file.read_text())
+                if isinstance(cached_payload, dict) and "usage" in cached_payload:
+                    usage = cached_payload.get("usage")
+                    cached_org_id = cached_payload.get("org_id")
+                    if isinstance(cached_org_id, str) and cached_org_id:
+                        org_id = cached_org_id
+                else:
+                    usage = cached_payload
+                source_timestamp = cache_mtime
+            elif age > cache_max_age_seconds:
+                cache_error = "Cached usage is stale"
+            else:
+                cache_error = "Cached usage timestamp is in the future"
         except Exception:
-            pass
+            cache_error = "Cached usage is unreadable"
+
+    if usage is None:
+        error = cache_error or live_error or "Failed to fetch usage (curl_cffi + cache both failed)"
+        _upsert("red", error=error, org_id=org_id)
+        return
 
     if not isinstance(usage, dict):
         _upsert("red", error="Failed to fetch usage (curl_cffi + cache both failed)", org_id=org_id)
@@ -992,19 +1072,50 @@ def poll_claude(conn):
         except Exception:
             return None
 
-    fh = usage.get("five_hour") or {}
-    sd = usage.get("seven_day") or {}
-    sn = usage.get("seven_day_sonnet") or {}
+    raw_windows = [
+        usage.get("five_hour"),
+        usage.get("seven_day"),
+        usage.get("seven_day_sonnet"),
+    ]
+    if any(window is not None and not isinstance(window, dict) for window in raw_windows):
+        _upsert(
+            "red",
+            error="Usage response contained invalid quota windows",
+            scraped_at=source_timestamp,
+            org_id=org_id,
+        )
+        return
+
+    fh, sd, sn = [window or {} for window in raw_windows]
 
     five_hour_pct = fh.get("utilization")
     seven_day_pct = sd.get("utilization")
     sonnet_7d_pct = sn.get("utilization")
 
-    pcts = [p for p in [five_hour_pct, seven_day_pct, sonnet_7d_pct] if p is not None]
+    raw_pcts = [five_hour_pct, seven_day_pct, sonnet_7d_pct]
+    invalid_pcts = [
+        p for p in raw_pcts
+        if p is not None and (
+            isinstance(p, bool)
+            or not isinstance(p, (int, float))
+            or not math.isfinite(p)
+        )
+    ]
+    if invalid_pcts:
+        _upsert(
+            "red",
+            error="Usage response contained invalid utilization values",
+            scraped_at=source_timestamp,
+            org_id=org_id,
+        )
+        return
+
+    pcts = [p for p in raw_pcts if p is not None]
     if not pcts:
         _upsert(
             "red",
             error="Usage response contained no utilization values",
+            scraped_at=source_timestamp,
             org_id=org_id,
         )
         return
@@ -1017,6 +1128,7 @@ def poll_claude(conn):
 
     _upsert(
         state,
+        scraped_at=source_timestamp,
         five_hour_pct=five_hour_pct,
         five_hour_resets=_iso_to_unix(fh.get("resets_at")),
         seven_day_pct=seven_day_pct,
