@@ -1,6 +1,7 @@
 """Production-bound tests for the LaunchAgent startup script."""
 
 import os
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,42 @@ START_SCRIPT = REPO_ROOT / "start.sh"
 
 
 class TestStartup(unittest.TestCase):
+    def test_tracked_quota_launchagent_invokes_claude_quota_provider(self):
+        plist_path = (
+            REPO_ROOT / "Library" / "LaunchAgents" /
+            "ai.ccagents.claude-rate-limit-poll.plist"
+        )
+        with plist_path.open("rb") as handle:
+            launchagent = plistlib.load(handle)
+
+        self.assertEqual(
+            launchagent["ProgramArguments"],
+            [
+                "/usr/bin/python3",
+                "/Users/zt_mini/.cc-agents/tools/claude-usage/cli.py",
+                "scan",
+                "--provider",
+                "claude-quotas",
+            ],
+        )
+
+    def test_tracked_dashboard_launchagent_invokes_start_script(self):
+        plist_path = (
+            REPO_ROOT / "Library" / "LaunchAgents" /
+            "ai.ccagents.claude-usage.plist"
+        )
+        self.assertTrue(plist_path.is_file(), "dashboard LaunchAgent must be source-tracked")
+        with plist_path.open("rb") as handle:
+            launchagent = plistlib.load(handle)
+
+        self.assertEqual(launchagent["Label"], "ai.ccagents.claude-usage")
+        self.assertEqual(launchagent["ProgramArguments"][:2], ["/bin/bash", "-l"])
+        self.assertTrue(
+            launchagent["ProgramArguments"][2].endswith(
+                "/tools/claude-usage/start.sh"
+            )
+        )
+
     def test_startup_forces_loopback_even_when_host_is_overridden(self):
         self.assertTrue(START_SCRIPT.is_file(), "start.sh must be source-tracked")
 
