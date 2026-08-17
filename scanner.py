@@ -379,10 +379,22 @@ def upsert_sessions(conn, sessions):
 
 def insert_turns(conn, turns):
     conn.executemany("""
-        INSERT OR IGNORE INTO turns
+        INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
              cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) WHERE message_id IS NOT NULL AND message_id != ''
+        DO UPDATE SET
+            session_id = excluded.session_id,
+            timestamp = excluded.timestamp,
+            model = excluded.model,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_creation_tokens = excluded.cache_creation_tokens,
+            tool_name = excluded.tool_name,
+            cwd = excluded.cwd
+        WHERE excluded.timestamp >= turns.timestamp
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
@@ -857,8 +869,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         conn.commit()
 
     # Recompute session totals from actual turns in DB.
-    # This ensures correctness when INSERT OR IGNORE skips duplicate turns
-    # but upsert_sessions had already added their tokens additively.
+    # This ensures correctness when cross-file conflicts replace an earlier
+    # streaming record with the later final record.
     if new_files or updated_files:
         conn.execute("""
             UPDATE sessions SET
@@ -945,7 +957,8 @@ def poll_claude(conn):
     from datetime import datetime
     from pathlib import Path
 
-    now = int(time.time())
+    now_ts = time.time()
+    now = int(now_ts)
     cursor = conn.cursor()
     key_file = Path.home() / ".cc-agents" / "scripts" / ".claude-session-key"
     cf_file = Path.home() / ".cc-agents" / "scripts" / ".claude-cf-clearance"
@@ -1011,13 +1024,17 @@ def poll_claude(conn):
                     if not isinstance(organizations, list) or not organizations:
                         live_error = "Failed to fetch organizations"
                     else:
-                        organization = organizations[0]
-                        if not isinstance(organization, dict):
-                            live_error = "Organization response contained no usable id"
-                            candidate_org_id = None
-                        else:
-                            candidate_org_id = organization.get("uuid") or organization.get("id")
-                        if not isinstance(candidate_org_id, str) or not candidate_org_id:
+                        candidate_org_id = next(
+                            (
+                                org.get("uuid") or org.get("id")
+                                for org in organizations
+                                if isinstance(org, dict)
+                                and isinstance(org.get("uuid") or org.get("id"), str)
+                                and (org.get("uuid") or org.get("id"))
+                            ),
+                            None,
+                        )
+                        if not candidate_org_id:
                             live_error = "Organization response contained no usable id"
                         else:
                             org_id = candidate_org_id
@@ -1042,8 +1059,8 @@ def poll_claude(conn):
     # Strategy 2: read cached JSON from browser agent
     if usage is None and cache_file.exists():
         try:
-            cache_mtime = int(cache_file.stat().st_mtime)
-            age = now - cache_mtime
+            cache_mtime = cache_file.stat().st_mtime
+            age = now_ts - cache_mtime
             if 0 <= age <= cache_max_age_seconds:
                 cached_payload = json.loads(cache_file.read_text())
                 if isinstance(cached_payload, dict) and "usage" in cached_payload:
@@ -1053,7 +1070,7 @@ def poll_claude(conn):
                         org_id = cached_org_id
                 else:
                     usage = cached_payload
-                source_timestamp = cache_mtime
+                source_timestamp = int(cache_mtime)
             elif age > cache_max_age_seconds:
                 cache_error = "Cached usage is stale"
             else:
@@ -1135,6 +1152,9 @@ def poll_claude(conn):
     else:
         state = "green"
 
+    if live_error:
+        state = "red"
+
     if live_cache_payload is not None:
         try:
             cache_file.write_text(json.dumps(live_cache_payload))
@@ -1143,6 +1163,7 @@ def poll_claude(conn):
 
     _upsert(
         state,
+        error=live_error,
         scraped_at=source_timestamp,
         five_hour_pct=five_hour_pct,
         five_hour_resets=_iso_to_unix(fh.get("resets_at")),

@@ -813,6 +813,106 @@ class TestDatabaseOperations(unittest.TestCase):
             "Usage response contained invalid utilization values",
         )
 
+    def test_live_source_failure_with_fresh_cache_remains_non_green(self):
+        now = 1_000_000
+
+        class FakeResponse:
+            status_code = 500
+
+        fake_module = types.SimpleNamespace(
+            requests=types.SimpleNamespace(get=lambda url, **kwargs: FakeResponse())
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ".claude-session-key").write_text("fixture-session")
+            (scripts_dir / ".claude-cf-clearance").write_text("fixture-clearance")
+            cache_file = scripts_dir / ".claude-usage-latest.json"
+            cache_file.write_text(json.dumps({
+                "five_hour": {"utilization": 23.0},
+            }))
+            os.utime(cache_file, (now - 10, now - 10))
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch("time.time", return_value=now), \
+                    mock.patch.dict("sys.modules", {"curl_cffi": fake_module}):
+                poll_claude(self.conn)
+
+        row = self.conn.execute(
+            "SELECT last_state, last_error, five_hour_pct, scraped_at "
+            "FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "red")
+        self.assertEqual(row["last_error"], "Failed to fetch organizations (HTTP 500)")
+        self.assertEqual(row["five_hour_pct"], 23.0)
+        self.assertEqual(row["scraped_at"], now - 10)
+
+    def test_fractionally_future_dated_cache_fails_closed(self):
+        now = 1_000_000
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            cache_file = scripts_dir / ".claude-usage-latest.json"
+            cache_file.write_text(json.dumps({
+                "five_hour": {"utilization": 23.0},
+            }))
+            os.utime(cache_file, (now + 0.5, now + 0.5))
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch("time.time", return_value=now):
+                poll_claude(self.conn)
+
+        row = self.conn.execute(
+            "SELECT last_state, last_error, five_hour_pct "
+            "FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "red")
+        self.assertEqual(row["last_error"], "Cached usage timestamp is in the future")
+        self.assertIsNone(row["five_hour_pct"])
+
+    def test_organization_discovery_skips_unusable_entries(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            if url == "https://claude.ai/api/organizations":
+                return FakeResponse(200, [{}, {"uuid": "later-good"}])
+            return FakeResponse(200, {"five_hour": {"utilization": 23.0}})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            scripts_dir = home / ".cc-agents" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ".claude-session-key").write_text("fixture-session")
+            (scripts_dir / ".claude-cf-clearance").write_text("fixture-clearance")
+            fake_module = types.SimpleNamespace(
+                requests=types.SimpleNamespace(get=fake_get)
+            )
+
+            with mock.patch("pathlib.Path.home", return_value=home), \
+                    mock.patch.dict("sys.modules", {"curl_cffi": fake_module}):
+                poll_claude(self.conn)
+
+        row = self.conn.execute(
+            "SELECT last_state, org_id FROM claude_rate_limits WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(row["last_state"], "green")
+        self.assertEqual(row["org_id"], "later-good")
+        self.assertEqual(
+            calls[-1],
+            "https://claude.ai/api/organizations/later-good/usage",
+        )
+
     def test_fresh_enveloped_cache_restores_dynamic_organization(self):
         now = 1_000_000
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1060,6 +1160,45 @@ class TestCrossFileSessionTotals(unittest.TestCase):
         self.assertEqual(session["total_output_tokens"], 150)  # 50 + 100
         self.assertEqual(session["turn_count"], 2)
         conn.close()
+
+    def test_cross_file_streaming_duplicate_keeps_latest_final_usage(self):
+        f1 = self.projects_dir / "file1.jsonl"
+        f1.write_text(_make_assistant_record(
+            session_id="sess-1",
+            message_id="same-message",
+            input_tokens=100,
+            output_tokens=10,
+            cache_read=0,
+            cache_creation=0,
+            timestamp="2026-04-08T10:00:00Z",
+        ) + "\n")
+        f2 = self.projects_dir / "file2.jsonl"
+        f2.write_text(_make_assistant_record(
+            session_id="sess-1",
+            message_id="same-message",
+            input_tokens=900,
+            output_tokens=90,
+            cache_read=0,
+            cache_creation=0,
+            timestamp="2026-04-08T10:01:00Z",
+        ) + "\n")
+
+        scan(projects_dir=self.projects_dir.parent.parent, db_path=self.db_path, verbose=False)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        turn = conn.execute(
+            "SELECT input_tokens, output_tokens, timestamp FROM turns "
+            "WHERE message_id='same-message'"
+        ).fetchone()
+        session = conn.execute(
+            "SELECT total_input_tokens, total_output_tokens, turn_count "
+            "FROM sessions WHERE session_id='sess-1'"
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(tuple(turn), (900, 90, "2026-04-08T10:01:00Z"))
+        self.assertEqual(tuple(session), (900, 90, 1))
 
 
 class TestParseJsonlFileLineCount(unittest.TestCase):
